@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+CONFIG_DIR="$HOME/.config/pomogator"
+XRAY_BIN="${XRAY_BIN:-xray}"
+TUN2SOCKS_BIN="${TUN2SOCKS_BIN:-tun2socks}"
+PROXY_PORT="${PROXY_PORT:-2081}"
+PID_FILE="$CONFIG_DIR/xray.pid"
+TUN_PID_FILE="$CONFIG_DIR/tun.pid"
+CONF_FILE="$CONFIG_DIR/xray.json"
+KEY_FILE="$CONFIG_DIR/key.txt"
+TUN_DEV="tun-vpn"
+TUN_GW="198.18.0.1"
+TUN_ADDR="198.18.0.2/15"
+ROUTES_FILE="$CONFIG_DIR/routes.conf"
+MODE_FILE="$CONFIG_DIR/route_mode.txt"
+ROUTE_MODE="global"
+XRAY_MARK=255
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+mkdir -p "$CONFIG_DIR"
+
+if [[ -f "$MODE_FILE" ]]; then
+    ROUTE_MODE=$(cat "$MODE_FILE" 2>/dev/null)
+fi
+
+if [[ ! -f "$ROUTES_FILE" ]]; then
+    cat > "$ROUTES_FILE" << 'ROUTES'
+ROUTES
+fi
+
+get_hwid() {
+    if [[ -f /etc/machine-id ]]; then
+        cat /etc/machine-id
+    elif [[ -f /var/lib/dbus/machine-id ]]; then
+        cat /var/lib/dbus/machine-id
+    else
+        echo "unknown"
+    fi
+}
+
+is_running() {
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+tun_is_running() {
+    if [[ -f "$TUN_PID_FILE" ]] && sudo kill -0 "$(cat "$TUN_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+tun_start() {
+    if ! is_running; then
+        echo -e "${RED}Сначала подключись к серверу${RESET}"
+        return 1
+    fi
+    if tun_is_running; then
+        echo -e "${YELLOW}TUN уже активен${RESET}"
+        return 0
+    fi
+
+    local has_tun2socks=false
+    command -v "$TUN2SOCKS_BIN" &>/dev/null && has_tun2socks=true
+    [[ "$has_tun2socks" == false && -x "$HOME/.local/bin/tun2socks" ]] && { TUN2SOCKS_BIN="$HOME/.local/bin/tun2socks"; has_tun2socks=true; }
+    if [[ "$has_tun2socks" == false ]]; then
+        echo -e "${RED}tun2socks не найден. Установи: https://github.com/xjasonlyu/tun2socks/releases${RESET}"
+        return 1
+    fi
+
+    local default_gw default_dev
+    default_gw=$(ip route show default | awk '{print $3; exit}')
+    default_dev=$(ip route show default | awk '{print $5; exit}')
+
+    local server_ip
+    server_ip=$(python3 -c "
+import json
+with open('$CONF_FILE') as f:
+    c = json.load(f)
+for o in c['outbounds']:
+    if o.get('protocol') == 'vless':
+        print(o['settings']['vnext'][0]['address'])
+        break
+")
+
+    local resolved_ip="$server_ip"
+    if ! [[ "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        resolved_ip=$(getent ahostsv4 "$server_ip" 2>/dev/null | awk '{print $1; exit}')
+    fi
+
+    echo "$resolved_ip" > "$CONFIG_DIR/server_ip.txt"
+    echo "$default_gw" > "$CONFIG_DIR/default_gw.txt"
+    echo "$default_dev" > "$CONFIG_DIR/default_dev.txt"
+
+    sudo ip tuntap add dev "$TUN_DEV" mode tun 2>/dev/null
+    sudo ip addr add "$TUN_ADDR" dev "$TUN_DEV" 2>/dev/null
+    sudo ip link set dev "$TUN_DEV" up 2>/dev/null
+    sudo ip route add "$resolved_ip/32" via "$default_gw" dev "$default_dev" 2>/dev/null
+    sudo ip route add default via "$TUN_GW" dev "$TUN_DEV" metric 1 2>/dev/null
+    sudo ip rule add fwmark $XRAY_MARK lookup main priority 50 2>/dev/null
+
+    sudo "$TUN2SOCKS_BIN" -device "$TUN_DEV" -proxy "socks5://127.0.0.1:${PROXY_PORT}" -loglevel silent </dev/null &>/dev/null &
+    echo $! > "$TUN_PID_FILE"
+    sleep 1
+
+    if tun_is_running; then
+        echo -e "${GREEN}${BOLD}Глобальный режим включён${RESET}"
+    else
+        echo -e "${RED}Не удалось запустить tun2socks${RESET}"
+        tun_stop_silent
+    fi
+}
+
+launch_via_vpn() {
+    if ! is_running; then
+        echo -e "${RED}Сначала подключись к серверу${RESET}"
+        return
+    fi
+    echo -ne "${BOLD}Команда для запуска через VPN: ${RESET}"
+    read -r cmd
+    [[ -z "$cmd" ]] && return
+    echo -e "${CYAN}Запускаю: ${cmd}${RESET}"
+    ALL_PROXY="socks5h://127.0.0.1:${PROXY_PORT}" \
+    HTTP_PROXY="http://127.0.0.1:$((PROXY_PORT + 1))" \
+    HTTPS_PROXY="http://127.0.0.1:$((PROXY_PORT + 1))" \
+    http_proxy="http://127.0.0.1:$((PROXY_PORT + 1))" \
+    https_proxy="http://127.0.0.1:$((PROXY_PORT + 1))" \
+    $cmd </dev/null &>/dev/null &
+    echo -e "${GREEN}Запущено (PID: $!)${RESET}"
+}
+
+tun_stop_silent() {
+    if [[ -f "$TUN_PID_FILE" ]]; then
+        sudo kill "$(cat "$TUN_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$TUN_PID_FILE"
+    fi
+    sudo ip rule del fwmark $XRAY_MARK lookup main 2>/dev/null || true
+    sudo ip route del default via "$TUN_GW" dev "$TUN_DEV" 2>/dev/null || true
+    if [[ -f "$CONFIG_DIR/server_ip.txt" ]]; then
+        local sip dgw ddev
+        sip=$(cat "$CONFIG_DIR/server_ip.txt" 2>/dev/null)
+        dgw=$(cat "$CONFIG_DIR/default_gw.txt" 2>/dev/null)
+        ddev=$(cat "$CONFIG_DIR/default_dev.txt" 2>/dev/null)
+        sudo ip route del "$sip/32" via "$dgw" dev "$ddev" 2>/dev/null || true
+        rm -f "$CONFIG_DIR/server_ip.txt" "$CONFIG_DIR/default_gw.txt" "$CONFIG_DIR/default_dev.txt"
+    fi
+    sudo ip link del "$TUN_DEV" 2>/dev/null || true
+}
+
+tun_stop() {
+    tun_stop_silent
+    echo -e "${YELLOW}Глобальный режим выключен${RESET}"
+}
+
+stop_vpn() {
+    tun_stop_silent
+    if is_running; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null
+        rm -f "$PID_FILE"
+        echo -e "${YELLOW}VPN остановлен${RESET}"
+    fi
+}
+
+declare -a SERVER_NAMES=()
+declare -a SERVER_LINKS=()
+
+fetch_servers() {
+    local url="$1"
+    local hwid
+    hwid=$(get_hwid)
+
+    echo -e "${CYAN}Загрузка серверов...${RESET}"
+    local raw
+    raw=$(curl -s --connect-timeout 10 "$url" -H "x-hwid: $hwid") || {
+        echo -e "${RED}Ошибка загрузки${RESET}"; return 1
+    }
+
+    local decoded
+    decoded=$(echo "$raw" | base64 -d 2>/dev/null) || {
+        echo -e "${RED}Ошибка декодирования${RESET}"; return 1
+    }
+
+    SERVER_NAMES=()
+    SERVER_LINKS=()
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" != vless://* ]] && continue
+        [[ "$line" == *"@0.0.0.0:"* ]] && continue
+        [[ "$line" == *"@1.1.1.1:"* ]] && continue
+
+        local fragment="${line##*#}"
+        local name
+        name=$(python3 -c "from urllib.parse import unquote; print(unquote('$fragment'))" 2>/dev/null || echo "$fragment")
+
+        SERVER_NAMES+=("$name")
+        SERVER_LINKS+=("$line")
+    done <<< "$decoded"
+
+    if [[ ${#SERVER_NAMES[@]} -eq 0 ]]; then
+        echo -e "${RED}Серверы не найдены${RESET}"
+        return 1
+    fi
+
+    echo "$url" > "$KEY_FILE"
+    echo -e "${GREEN}Загружено серверов: ${#SERVER_NAMES[@]}${RESET}"
+}
+
+generate_config() {
+    local link="$1"
+    python3 -c "
+import json, sys
+from urllib.parse import urlparse, parse_qs
+
+link = sys.argv[1].split('#')[0]
+p = urlparse(link)
+q = parse_qs(p.query)
+
+uuid = p.username
+host = p.hostname
+port = p.port or 443
+flow = q.get('flow', [''])[0]
+net = q.get('type', ['tcp'])[0]
+sec = q.get('security', ['none'])[0]
+sni = q.get('sni', [''])[0]
+fp = q.get('fp', ['chrome'])[0]
+pbk = q.get('pbk', [''])[0]
+sid = q.get('sid', [''])[0]
+path = q.get('path', ['/'])[0]
+svc = q.get('serviceName', [''])[0]
+host_hdr = q.get('host', [''])[0]
+
+user = {'id': uuid, 'encryption': 'none'}
+if flow:
+    user['flow'] = flow
+
+so = {'mark': 255}
+stream = {'network': net, 'sockopt': so}
+
+if sec == 'reality':
+    stream['security'] = 'reality'
+    stream['realitySettings'] = {
+        'serverName': sni,
+        'publicKey': pbk,
+        'shortId': sid,
+        'fingerprint': fp
+    }
+elif sec == 'tls':
+    stream['security'] = 'tls'
+    stream['tlsSettings'] = {
+        'serverName': sni or host,
+        'fingerprint': fp
+    }
+
+if net == 'ws':
+    stream['wsSettings'] = {'path': path, 'headers': {'Host': host_hdr or sni or host}}
+elif net == 'grpc':
+    stream['grpcSettings'] = {'serviceName': svc}
+elif net == 'xhttp':
+    stream['xhttpSettings'] = {'path': path, 'mode': 'auto'}
+
+route_mode = sys.argv[3] if len(sys.argv) > 3 else 'global'
+routes_file = sys.argv[4] if len(sys.argv) > 4 else ''
+
+domains = []
+ips = []
+if routes_file:
+    import re
+    try:
+        with open(routes_file) as rf:
+            for rline in rf:
+                rline = rline.strip()
+                if not rline or rline.startswith('#'):
+                    continue
+                if re.match(r'^[0-9]+\.', rline) and ('/' in rline or re.match(r'^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$', rline)):
+                    ips.append(rline if '/' in rline else rline + '/32')
+                else:
+                    domains.append('domain:' + rline)
+    except: pass
+
+vless_out = {
+    'tag': 'proxy',
+    'protocol': 'vless',
+    'settings': {'vnext': [{'address': host, 'port': port, 'users': [user]}]},
+    'streamSettings': stream
+}
+direct_out = {'tag': 'direct', 'protocol': 'freedom', 'streamSettings': {'sockopt': {'mark': 255}}}
+
+outbounds = [vless_out, direct_out]
+routing = None
+
+if route_mode == 'bypass' and (domains or ips):
+    rules = []
+    if domains:
+        rules.append({'type': 'field', 'domain': domains, 'outboundTag': 'direct'})
+    if ips:
+        rules.append({'type': 'field', 'ip': ips, 'outboundTag': 'direct'})
+    routing = {'domainStrategy': 'AsIs', 'rules': rules}
+elif route_mode == 'only' and (domains or ips):
+    rules = []
+    if domains:
+        rules.append({'type': 'field', 'domain': domains, 'outboundTag': 'proxy'})
+    if ips:
+        rules.append({'type': 'field', 'ip': ips, 'outboundTag': 'proxy'})
+    outbounds = [direct_out, vless_out]
+    routing = {'domainStrategy': 'AsIs', 'rules': rules}
+
+cfg = {
+    'log': {'loglevel': 'none'},
+    'inbounds': [{
+        'port': int(sys.argv[2]),
+        'listen': '127.0.0.1',
+        'protocol': 'socks',
+        'settings': {'udp': True}
+    }, {
+        'port': int(sys.argv[2]) + 1,
+        'listen': '127.0.0.1',
+        'protocol': 'http'
+    }],
+    'outbounds': outbounds
+}
+if routing:
+    cfg['routing'] = routing
+
+json.dump(cfg, sys.stdout, indent=2)
+" "$link" "$PROXY_PORT" "$ROUTE_MODE" "$ROUTES_FILE"
+}
+
+connect_server() {
+    local idx="$1"
+    local link="${SERVER_LINKS[$idx]}"
+    local name="${SERVER_NAMES[$idx]}"
+    CURRENT_SERVER_IDX=$idx
+
+    stop_vpn
+
+    generate_config "$link" > "$CONF_FILE" || {
+        echo -e "${RED}Ошибка генерации конфига${RESET}"; return 1
+    }
+
+    "$XRAY_BIN" run -c "$CONF_FILE" &>/dev/null &
+    echo $! > "$PID_FILE"
+    sleep 1
+
+    if is_running; then
+        echo -e "${GREEN}${BOLD}Подключено: ${name}${RESET}"
+        echo -e "  SOCKS5: ${CYAN}127.0.0.1:${PROXY_PORT}${RESET}"
+        echo -e "  HTTP:   ${CYAN}127.0.0.1:$((PROXY_PORT + 1))${RESET}"
+    else
+        echo -e "${RED}Не удалось запустить xray${RESET}"
+        rm -f "$PID_FILE"
+    fi
+}
+
+show_status() {
+    if is_running; then
+        echo -e "${GREEN}● VPN активен${RESET} (PID: $(cat "$PID_FILE"))"
+        if tun_is_running; then
+            echo -e "${GREEN}● Глобальный режим (TUN)${RESET}"
+        else
+            echo -e "${YELLOW}● Только прокси (SOCKS5/HTTP)${RESET}"
+        fi
+        local mode_label
+        case "$ROUTE_MODE" in
+            global) mode_label="Всё через VPN" ;;
+            bypass) mode_label="Обход: список напрямую, остальное через VPN" ;;
+            only)   mode_label="Только список через VPN, остальное напрямую" ;;
+        esac
+        echo -e "${CYAN}● Маршрут: ${mode_label}${RESET}"
+    else
+        echo -e "${RED}● VPN отключен${RESET}"
+    fi
+}
+
+switch_route_mode() {
+    echo -e "${BOLD}Режим маршрутизации:${RESET}"
+    echo -e "  ${BOLD}1${RESET}) Глобальный — всё через VPN"
+    echo -e "  ${BOLD}2${RESET}) Обход — список идёт напрямую, остальное через VPN"
+    echo -e "  ${BOLD}3${RESET}) Только список — список через VPN, остальное напрямую"
+    echo
+    echo -ne "${BOLD}> ${RESET}"
+    read -r m
+    case "$m" in
+        1) ROUTE_MODE="global" ;;
+        2) ROUTE_MODE="bypass" ;;
+        3) ROUTE_MODE="only" ;;
+        *) echo -e "${RED}Неверный выбор${RESET}"; return ;;
+    esac
+    echo "$ROUTE_MODE" > "$MODE_FILE"
+    echo -e "${GREEN}Режим: $ROUTE_MODE${RESET}"
+    if is_running; then
+        echo -e "${YELLOW}Переподключаюсь...${RESET}"
+        reconnect_current
+    fi
+}
+
+edit_routes() {
+    local editor="${EDITOR:-nano}"
+    command -v "$editor" &>/dev/null || editor="vi"
+    "$editor" "$ROUTES_FILE"
+    if is_running; then
+        echo -e "${YELLOW}Переподключаюсь с новыми маршрутами...${RESET}"
+        reconnect_current
+        sleep 1
+    fi
+}
+
+find_process() {
+    echo -ne "${BOLD}Введи часть имени процесса: ${RESET}"
+    read -r query
+    [[ -z "$query" ]] && return
+    echo
+    echo -e "${BOLD}  PID   | Путь${RESET}"
+    echo "  ------+------------------------------------------"
+    local found=false
+    while read -r pid; do
+        local exe
+        exe=$(readlink -f /proc/"$pid"/exe 2>/dev/null) || continue
+        [[ -z "$exe" || "$exe" == *"(deleted)"* ]] && continue
+        local name
+        name=$(basename "$exe")
+        printf "  ${CYAN}%-6s${RESET}| %s\n" "$pid" "$exe"
+        found=true
+    done < <(pgrep -if "$query" 2>/dev/null)
+    if [[ "$found" == false ]]; then
+        echo -e "  ${RED}Ничего не найдено${RESET}"
+    else
+        echo
+        echo -e "${YELLOW}Скопируй путь и добавь в routes.conf:${RESET}"
+        echo -e "  ${GREEN}process:/путь/к/процессу${RESET}"
+    fi
+}
+
+CURRENT_SERVER_IDX=-1
+
+reconnect_current() {
+    if [[ $CURRENT_SERVER_IDX -ge 0 ]]; then
+        connect_server $CURRENT_SERVER_IDX
+    fi
+}
+
+show_menu() {
+    clear
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${CYAN}║         POMOGATOR             ║${RESET}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════╝${RESET}"
+    echo
+    show_status
+    echo
+
+    if [[ ${#SERVER_NAMES[@]} -gt 0 ]]; then
+        for i in "${!SERVER_NAMES[@]}"; do
+            printf "  ${BOLD}%2d${RESET}) %s\n" "$((i + 1))" "${SERVER_NAMES[$i]}"
+        done
+        echo
+        echo -e "  ${BOLD} g${RESET}) Глобальный режим (весь трафик)"
+        echo -e "  ${BOLD} v${RESET}) Запустить программу через VPN"
+        echo -e "  ${BOLD} m${RESET}) Маршрутизация (домены/IP)"
+        echo -e "  ${BOLD} e${RESET}) Редактировать список маршрутов"
+        echo -e "  ${BOLD} t${RESET}) Проверить соединение"
+        echo -e "  ${BOLD} r${RESET}) Обновить серверы"
+        echo -e "  ${BOLD} d${RESET}) Отключить VPN"
+        echo -e "  ${BOLD} k${RESET}) Сменить ключ"
+        echo -e "  ${BOLD} 0${RESET}) Выход"
+    else
+        echo -e "  ${BOLD} 1${RESET}) Ввести ключ подписки"
+        echo -e "  ${BOLD} 0${RESET}) Выход"
+    fi
+    echo
+}
+
+test_connection() {
+    if ! is_running; then
+        echo -e "${RED}VPN не подключен${RESET}"
+        return
+    fi
+    echo -e "${CYAN}Проверка...${RESET}"
+    local ip
+    ip=$(curl -x socks5h://127.0.0.1:${PROXY_PORT} -s --connect-timeout 10 https://ifconfig.me 2>/dev/null)
+    if [[ -n "$ip" ]]; then
+        echo -e "${GREEN}IP: ${ip}${RESET}"
+    else
+        echo -e "${RED}Нет соединения${RESET}"
+    fi
+}
+
+prompt_key() {
+    echo -ne "${BOLD}Вставь ключ подписки: ${RESET}"
+    read -r key
+    [[ -z "$key" ]] && return
+    fetch_servers "$key"
+}
+
+main() {
+    command -v "$XRAY_BIN" &>/dev/null || {
+        if [[ -x "$HOME/.local/bin/xray" ]]; then
+            XRAY_BIN="$HOME/.local/bin/xray"
+        else
+            echo -e "${RED}xray не найден. Установи: https://github.com/XTLS/Xray-core/releases${RESET}"
+            exit 1
+        fi
+    }
+
+    command -v python3 &>/dev/null || { echo -e "${RED}python3 не найден${RESET}"; exit 1; }
+    command -v curl &>/dev/null || { echo -e "${RED}curl не найден${RESET}"; exit 1; }
+
+    if [[ -f "$KEY_FILE" ]]; then
+        fetch_servers "$(cat "$KEY_FILE")"
+    fi
+
+    while true; do
+        show_menu
+        echo -ne "${BOLD}> ${RESET}"
+        read -r choice
+
+        if [[ ${#SERVER_NAMES[@]} -eq 0 ]]; then
+            case "$choice" in
+                1) prompt_key ;;
+                0) stop_vpn; exit 0 ;;
+                *) ;;
+            esac
+        else
+            case "$choice" in
+                0) stop_vpn; echo -e "${CYAN}Пока!${RESET}"; exit 0 ;;
+                g) if tun_is_running; then tun_stop; else tun_start; fi; read -rp "Enter..." ;;
+                v) launch_via_vpn; read -rp "Enter..." ;;
+                m) switch_route_mode; read -rp "Enter..." ;;
+                e) edit_routes ;;
+                t) test_connection; read -rp "Enter..." ;;
+                r) [[ -f "$KEY_FILE" ]] && fetch_servers "$(cat "$KEY_FILE")"; sleep 1 ;;
+                d) stop_vpn; sleep 1 ;;
+                k) prompt_key; sleep 1 ;;
+                *)
+                    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#SERVER_NAMES[@]} )); then
+                        connect_server $((choice - 1))
+                        read -rp "Enter..."
+                    fi
+                    ;;
+            esac
+        fi
+    done
+}
+
+trap 'tun_stop_silent; stop_vpn' EXIT
+main "$@"
